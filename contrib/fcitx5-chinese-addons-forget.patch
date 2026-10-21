@@ -1,0 +1,310 @@
+diff --git a/im/pinyin/pinyin.cpp b/im/pinyin/pinyin.cpp
+index 73943c2..38a095e 100644
+--- a/im/pinyin/pinyin.cpp
++++ b/im/pinyin/pinyin.cpp
+@@ -424,7 +424,11 @@ void PinyinEngine::updateUI(InputContext *inputContext) {
+         auto sentence = context.sentence();
+         if (!inputContext->capabilityFlags().testAny(
+                 CapabilityFlag::PasswordOrSensitive)) {
++            const auto revision = ime_->dict()->blockedWordsRevision();
+             state->context_.learn();
++            if (revision != ime_->dict()->blockedWordsRevision()) {
++                saveDeletedWords();
++            }
+         }
+         inputContext->commitString(sentence);
+         inputContext->updatePreedit();
+@@ -755,6 +759,7 @@ PinyinEngine::PinyinEngine(Instance *instance)
+         }
+     } while (0);
+ 
++    loadDeletedWords();
+     ime_->setScoreFilter(1);
+     loadBuiltInDict();
+     reloadConfig();
+@@ -1508,7 +1513,9 @@ void PinyinEngine::updateForgetCandidate(InputContext *inputContext) {
+     inputPanel.reset();
+ 
+     updatePreedit(inputContext);
+-    Text aux(_("[Select the word to remove from history]"));
++    Text aux(state->halveHistory_
++                 ? _("[Select the word whose learning history will be halved]")
++                 : _("[Select the word to delete from candidates]"));
+     inputPanel.setAuxUp(aux);
+ 
+     auto candidateList = std::make_unique<CommonCandidateList>();
+@@ -1531,7 +1538,8 @@ void PinyinEngine::updateForgetCandidate(InputContext *inputContext) {
+             }
+ 
+             candidateList->append<ForgetCandidateWord>(
+-                this, pyCandidate->text(), pyCandidate->idx_);
++                this, pyCandidate->text(), pyCandidate->idx_,
++                state->halveHistory_);
+         }
+     }
+     candidateList->setSelectionKey(selectionKeys_);
+@@ -1555,27 +1563,44 @@ void PinyinEngine::resetStroke(InputContext *inputContext) const {
+ void PinyinEngine::resetForgetCandidate(InputContext *inputContext) const {
+     auto *state = inputContext->propertyFor(&factory_);
+     state->forgetCandidateList_.reset();
++    state->halveHistory_ = false;
+     if (state->mode_ == PinyinMode::ForgetCandidate) {
+         state->mode_ = PinyinMode::Normal;
+     }
+ }
+ 
+-void PinyinEngine::forgetCandidate(InputContext *inputContext, size_t index) {
++void PinyinEngine::forgetCandidate(InputContext *inputContext, size_t index,
++                                   bool halveHistory) {
+     auto *state = inputContext->propertyFor(&factory_);
+ 
+     const std::string currentInput = state->context_.userInput();
+ 
+     if (index < state->context_.candidatesToCursor().size()) {
+-        const auto &sentence = state->context_.candidatesToCursor()[index];
+-        // If this is a word, remove it from user dict.
+-        if (sentence.size() == 1) {
+-            auto py = state->context_.candidateFullPinyin(index);
+-            state->context_.ime()->dict()->removeWord(
+-                libime::PinyinDictionary::UserDict, py, sentence.toString());
++        const auto &candidate = state->context_.candidatesToCursor()[index];
++        // Copy before dictionary mutations invalidate matching caches.
++        const auto text = candidate.toString();
++        const auto code = getEncodedPinyin(candidate);
++        const auto pinyin = state->context_.candidateFullPinyin(candidate);
++        if (code.empty() || pinyin.empty()) {
++            return;
+         }
+-        for (const auto &word : sentence.sentence()) {
+-            state->context_.ime()->model()->history().forget(word->word());
++        if (halveHistory) {
++            // Preserve the cumulative-history policy for constituent words.
++            std::unordered_set<std::string> forgotten;
++            for (const auto &word : candidate.sentence()) {
++                if (forgotten.insert(word->word()).second) {
++                    ime_->model()->history().forget(word->word());
++                }
++            }
++        } else {
++            // Delete the selected identity, never its individual characters.
++            // A per-user exclusion also covers read-only built-in dictionaries.
++            ime_->dict()->setWordBlocked(code, text, true);
++            ime_->dict()->removeWord(libime::PinyinDictionary::UserDict, pinyin,
++                                     text);
++            ime_->model()->history().remove(text, code);
+         }
++        save();
+     }
+     resetForgetCandidate(inputContext);
+     doReset(inputContext);
+@@ -1584,6 +1609,45 @@ void PinyinEngine::forgetCandidate(InputContext *inputContext, size_t index) {
+     updateUI(inputContext);
+ }
+ 
++void PinyinEngine::loadDeletedWords() {
++    RawConfig data;
++    readAsIni(data, StandardPathsType::PkgData, "pinyin/deleted-words.conf");
++    data.visitSubItems([this](const RawConfig &entry, const std::string &) {
++        const auto pinyinEntry = entry.get("Pinyin");
++        const auto word = entry.get("Word");
++        if (!pinyinEntry || !word) {
++            return true;
++        }
++        try {
++            const auto encoded =
++                libime::PinyinEncoder::encodeFullPinyinWithFlags(
++                    pinyinEntry->value(), libime::PinyinFuzzyFlag::VE_UE);
++            ime_->dict()->setWordBlocked(
++                std::string_view(encoded.data(), encoded.size()), word->value(),
++                true);
++        } catch (const std::exception &e) {
++            PINYIN_ERROR() << "Invalid deleted pinyin word: " << e.what();
++        }
++        return true;
++    });
++}
++
++bool PinyinEngine::saveDeletedWords() {
++    RawConfig data;
++    size_t index = 0;
++    for (const auto &[code, word] : ime_->dict()->blockedWords()) {
++        auto &entry = data[std::to_string(index++)];
++        entry["Pinyin"].setValue(libime::PinyinEncoder::decodeFullPinyin(code));
++        entry["Word"].setValue(word);
++    }
++    const bool saved = safeSaveAsIni(data, StandardPathsType::PkgData,
++                                     "pinyin/deleted-words.conf");
++    if (!saved) {
++        PINYIN_ERROR() << "Failed to save deleted pinyin words";
++    }
++    return saved;
++}
++
+ void PinyinEngine::saveCustomPhrase() {
+     instance_->eventDispatcher().scheduleWithContext(watch(), [this]() {
+         StandardPaths::global().safeSave(
+@@ -1732,8 +1796,12 @@ bool PinyinEngine::handleForgetCandidate(KeyEvent &event) {
+     if (state->mode_ == PinyinMode::Normal) {
+         if (!state->predictWords_ && candidateList && !candidateList->empty() &&
+             candidateList->toBulk() &&
+-            event.key().checkKeyList(*config_.forgetWord)) {
++            (event.key().checkKeyList(*config_.forgetWord) ||
++             event.key().checkKeyList(*config_.halveHistory))) {
+             resetForgetCandidate(inputContext);
++            state->halveHistory_ =
++                !event.key().checkKeyList(*config_.forgetWord) &&
++                event.key().checkKeyList(*config_.halveHistory);
+             state->forgetCandidateList_ = std::move(candidateList);
+             state->mode_ = PinyinMode::ForgetCandidate;
+             updateForgetCandidate(inputContext);
+@@ -2222,6 +2290,8 @@ void PinyinEngine::setSubConfig(const std::string &path,
+     } else if (path == "clearalldict") {
+         ime_->dict()->clear(libime::PinyinDictionary::UserDict);
+         ime_->model()->history().clear();
++        ime_->dict()->clearBlockedWords();
++        saveDeletedWords();
+     } else if (path == "customphrase") {
+         loadCustomPhrase();
+     }
+@@ -2253,6 +2323,7 @@ void PinyinEngine::doReset(InputContext *inputContext) const {
+ 
+ void PinyinEngine::save() {
+     safeSaveAsIni(config_, "conf/pinyin.conf");
++    saveDeletedWords();
+     const auto &standardPath = StandardPaths::global();
+     standardPath.safeSave(
+         StandardPathsType::PkgData, "pinyin/user.dict", [this](int fd) {
+diff --git a/im/pinyin/pinyin.h b/im/pinyin/pinyin.h
+index 6dcf9bb..c15d756 100644
+--- a/im/pinyin/pinyin.h
++++ b/im/pinyin/pinyin.h
+@@ -225,9 +225,14 @@ FCITX_CONFIGURATION(
+                                   SwitchInputMethodBehavior::CommitPreedit};
+     KeyListOption forgetWord{this,
+                              "ForgetWord",
+-                             _("Forget word"),
++                             _("Delete word"),
+                              {Key("Control+7")},
+                              KeyListConstrain()};
++    KeyListOption halveHistory{this,
++                               "HalveHistory",
++                               _("Halve word learning history"),
++                               {Key("Control+Alt+7")},
++                               KeyListConstrain()};
+     KeyListOption prevPage{
+         this,
+         "PrevPage",
+@@ -370,6 +375,7 @@ public:
+ 
+     // Forget candidate
+     std::shared_ptr<CandidateList> forgetCandidateList_;
++    bool halveHistory_ = false;
+ 
+     std::unique_ptr<EventSourceTime> cancelLastEvent_;
+ 
+@@ -425,7 +431,8 @@ public:
+ 
+     void resetStroke(InputContext *inputContext) const;
+     void resetForgetCandidate(InputContext *inputContext) const;
+-    void forgetCandidate(InputContext *inputContext, size_t index);
++    void forgetCandidate(InputContext *inputContext, size_t index,
++                         bool halveHistory = false);
+     void pinCustomPhrase(InputContext *inputContext,
+                          const std::string &customPhrase);
+     void deleteCustomPhrase(InputContext *inputContext,
+@@ -482,6 +489,8 @@ private:
+     void loadDict(const std::string &fullPath,
+                   std::list<std::unique_ptr<TaskToken>> &taskTokens);
+     void saveCustomPhrase();
++    void loadDeletedWords();
++    bool saveDeletedWords();
+ 
+     Instance *instance_;
+     PinyinEngineConfig config_;
+diff --git a/im/pinyin/pinyincandidate.cpp b/im/pinyin/pinyincandidate.cpp
+index 915c5d2..cbf0075 100644
+--- a/im/pinyin/pinyincandidate.cpp
++++ b/im/pinyin/pinyincandidate.cpp
+@@ -204,13 +204,13 @@ size_t FilteredForgettableCandidate::candidateIndex() const {
+ }
+ 
+ ForgetCandidateWord::ForgetCandidateWord(PinyinEngine *engine, Text text,
+-                                         size_t index)
+-    : engine_(engine), index_(index) {
++                                         size_t index, bool halveHistory)
++    : engine_(engine), index_(index), halveHistory_(halveHistory) {
+     setText(std::move(text));
+ }
+ 
+ void ForgetCandidateWord::select(InputContext *inputContext) const {
+-    engine_->forgetCandidate(inputContext, index_);
++    engine_->forgetCandidate(inputContext, index_, halveHistory_);
+ }
+ 
+ LuaCandidateWord::LuaCandidateWord(PinyinEngine *engine, size_t selectLength,
+@@ -352,7 +352,12 @@ void CustomCloudPinyinCandidateWord::select(InputContext *inputContext) const {
+     CloudPinyinCandidateWord::select(inputContext);
+ }
+ 
+-enum { PINYIN_FORGET, PINYIN_CUSTOMPHRASE, PINYIN_DELETE_CUSTOMPHRASE };
++enum {
++    PINYIN_FORGET,
++    PINYIN_CUSTOMPHRASE,
++    PINYIN_DELETE_CUSTOMPHRASE,
++    PINYIN_HALVE_HISTORY
++};
+ 
+ PinyinActionableCandidateList::PinyinActionableCandidateList(
+     PinyinEngine *engine, InputContext *inputContext)
+@@ -369,8 +374,12 @@ std::vector<CandidateAction> PinyinActionableCandidateList::candidateActions(
+     if (isForgettable(candidate)) {
+         CandidateAction action;
+         action.setId(PINYIN_FORGET);
+-        action.setText(_("Forget candidate"));
++        action.setText(_("Delete candidate"));
+         result.push_back(std::move(action));
++        CandidateAction halveAction;
++        halveAction.setId(PINYIN_HALVE_HISTORY);
++        halveAction.setText(_("Halve word learning history"));
++        result.push_back(std::move(halveAction));
+     }
+     // If it's not custom phrase, or order is not at the top.
+     const auto *customPhrase =
+@@ -395,12 +404,14 @@ std::vector<CandidateAction> PinyinActionableCandidateList::candidateActions(
+ void PinyinActionableCandidateList::triggerAction(
+     const CandidateWord &candidate, int id) {
+     switch (id) {
+-    case PINYIN_FORGET: {
++    case PINYIN_FORGET:
++    case PINYIN_HALVE_HISTORY: {
+         if (const auto *pinyinCandidate =
+                 dynamic_cast<const ForgettableCandidateInterface *>(
+                     &candidate)) {
+             engine_->forgetCandidate(inputContext_,
+-                                     pinyinCandidate->candidateIndex());
++                                     pinyinCandidate->candidateIndex(),
++                                     id == PINYIN_HALVE_HISTORY);
+         }
+     } break;
+     case PINYIN_CUSTOMPHRASE: {
+diff --git a/im/pinyin/pinyincandidate.h b/im/pinyin/pinyincandidate.h
+index 6e4a971..ea75e8c 100644
+--- a/im/pinyin/pinyincandidate.h
++++ b/im/pinyin/pinyincandidate.h
+@@ -155,13 +155,15 @@ public:
+ 
+ class ForgetCandidateWord : public CandidateWord {
+ public:
+-    ForgetCandidateWord(PinyinEngine *engine, Text text, size_t index);
++    ForgetCandidateWord(PinyinEngine *engine, Text text, size_t index,
++                        bool halveHistory);
+ 
+     void select(InputContext *inputContext) const override;
+ 
+ private:
+     PinyinEngine *engine_;
+     size_t index_;
++    bool halveHistory_;
+ };
+ 
+ class LuaCandidateWord : public CandidateWord {

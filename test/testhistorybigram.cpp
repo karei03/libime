@@ -5,15 +5,19 @@
  */
 
 #include <cmath>
+#include <cstdint>
 #include <exception>
 #include <iostream>
 #include <ranges>
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <vector>
 #include <fcitx-utils/log.h>
 #include <fcitx-utils/stringutils.h>
 #include "libime/core/historybigram.h"
+#include "libime/core/utils_p.h"
+#include "libime/core/zstdfilter.h"
 
 namespace {
 
@@ -102,7 +106,8 @@ void testBasic() {
     }
     FCITX_ASSERT(!history.isUnknown("跑步"));
     history.forget("跑步");
-    FCITX_ASSERT(history.isUnknown("跑步"));
+    FCITX_ASSERT(history.rawUnigramFrequency({"跑步", ""}) == 50);
+    FCITX_ASSERT(history.rawBigramFrequency({"跑步", ""}, {"起来", ""}) == 100);
     std::cout << "paobuqilai "
               << history.score("", "跑") + history.score("跑", "不") +
                      history.score("不", "起来")
@@ -118,13 +123,8 @@ void testOverflow() {
     for (auto i : std::views::iota(0, total)) {
         history.add({std::to_string(i)});
     }
-    std::stringstream dump;
-    history.dump(dump);
-    int i;
-    int expect = total - 1;
-    while (dump >> i) {
-        FCITX_ASSERT(i == expect);
-        --expect;
+    for (auto i : std::views::iota(0, total)) {
+        FCITX_ASSERT(history.rawUnigramFrequency({std::to_string(i), ""}) == 1);
     }
 }
 
@@ -189,15 +189,6 @@ void testSaveAndLoadText() {
     for (auto i : std::views::iota(0, total)) {
         history.add({std::to_string(i)});
     }
-    std::stringstream dump;
-    history.dump(dump);
-    int i;
-    int expect = total - 1;
-    while (dump >> i) {
-        FCITX_ASSERT(i == expect);
-        --expect;
-    }
-
     std::stringstream dump1;
     std::stringstream dump2;
     std::stringstream ss;
@@ -317,13 +308,270 @@ void testAppend() {
                            {{"好人", "code4"}});
 
     history.addWithContext({{"不是", "code5"}}, {{"你的", "code6"}});
-    std::stringstream ss;
-    history.dump(ss);
-    auto lines = fcitx::stringutils::split(ss.str(), "\n");
-    FCITX_ASSERT(lines.size() == 2) << lines.size();
-    FCITX_ASSERT(lines[0] == "你的\tcode6") << lines[0];
-    FCITX_ASSERT(lines[1] == "你\tcode1 是\tcode2 一个\tcode3 好人\tcode4")
-        << lines[1];
+    FCITX_ASSERT(history.rawUnigramFrequency({"你", "code1"}) == 1);
+    FCITX_ASSERT(history.rawUnigramFrequency({"是", "code2"}) == 1);
+    FCITX_ASSERT(history.rawUnigramFrequency({"一个", "code3"}) == 1);
+    FCITX_ASSERT(history.rawUnigramFrequency({"好人", "code4"}) == 1);
+    FCITX_ASSERT(history.rawUnigramFrequency({"你的", "code6"}) == 1);
+    FCITX_ASSERT(history.rawUnigramFrequency({"不是", "code5"}) == 0);
+    FCITX_ASSERT(history.rawUnigramFrequency({"<s>", ""}) == 2);
+    FCITX_ASSERT(history.rawBigramFrequency({"一个", "code3"}, {"</s>", ""}) ==
+                 0);
+    FCITX_ASSERT(
+        history.rawBigramFrequency({"一个", "code3"}, {"好人", "code4"}) == 1);
+    FCITX_ASSERT(history.rawBigramFrequency({"好人", "code4"}, {"</s>", ""}) ==
+                 1);
+
+    // Counts and the latest append context survive both persistence formats.
+    for (bool binary : {false, true}) {
+        std::stringstream data;
+        if (binary)
+            history.save(data);
+        else
+            history.dump(data);
+        HistoryBigram loaded;
+        if (binary)
+            loaded.load(data);
+        else
+            loaded.loadText(data);
+        loaded.addWithContext({{"你的", "code6"}}, {{"朋友", "code7"}});
+        FCITX_ASSERT(loaded.rawUnigramFrequency({"你的", "code6"}) == 1);
+        FCITX_ASSERT(loaded.rawUnigramFrequency({"朋友", "code7"}) == 1);
+        FCITX_ASSERT(loaded.rawUnigramFrequency({"<s>", ""}) == 2);
+        FCITX_ASSERT(loaded.rawBigramFrequency({"你的", "code6"},
+                                               {"朋友", "code7"}) == 1);
+        FCITX_ASSERT(
+            loaded.rawBigramFrequency({"你的", "code6"}, {"</s>", ""}) == 0);
+    }
+}
+
+void testAbsoluteCountsAndFormula() {
+    using namespace libime;
+    HistoryBigram history;
+    for (int i = 0; i < 100; ++i)
+        history.add({"不对"});
+    for (int i = 0; i < 10; ++i)
+        history.add({"部队"});
+    history.add({"部队"});
+    FCITX_ASSERT(history.rawUnigramFrequency({"不对", ""}) == 100);
+    FCITX_ASSERT(history.rawUnigramFrequency({"部队", ""}) == 11);
+    FCITX_ASSERT(history.unigramFrequency({"不对", ""}) == 100);
+    FCITX_ASSERT(history.bigramFrequency({"<s>", ""}, {"不对", ""}) == 100);
+    // Keep original boundary observations and 0.5-count denominator smoothing.
+    const double expected = 0.2 * 100 / (333 + 0.5) + 0.8 * 100 / (111 + 0.5);
+    FCITX_ASSERT(
+        std::abs(std::pow(10.0, history.score("", "不对")) - expected) < 1e-6);
+    history.setUseOnlyUnigram(true);
+    FCITX_ASSERT(std::abs(std::pow(10.0, history.score("", "不对")) -
+                          100 / 333.5) < 1e-6);
+
+    // Exceed all three old pools combined; old evidence is neither moved,
+    // aged, nor discarded, and bigrams accumulate indefinitely too.
+    for (int i = 0; i < 100000; ++i)
+        history.add({"永久", "累计"});
+    FCITX_ASSERT(history.rawUnigramFrequency({"不对", ""}) == 100);
+    FCITX_ASSERT(history.rawUnigramFrequency({"永久", ""}) == 100000);
+    FCITX_ASSERT(history.rawBigramFrequency({"永久", ""}, {"累计", ""}) ==
+                 100000);
+    FCITX_ASSERT(history.rawBigramFrequency({"<s>", ""}, {"不对", ""}) == 100);
+    for (bool binary : {false, true}) {
+        std::stringstream data;
+        if (binary)
+            history.save(data);
+        else
+            history.dump(data);
+        HistoryBigram loaded;
+        if (binary)
+            loaded.load(data);
+        else
+            loaded.loadText(data);
+        FCITX_ASSERT(loaded.rawUnigramFrequency({"不对", ""}) == 100);
+        FCITX_ASSERT(loaded.rawBigramFrequency({"永久", ""}, {"累计", ""}) ==
+                     100000);
+    }
+}
+
+void testHalveAndClear() {
+    using namespace libime;
+    HistoryBigram history;
+    for (int i = 0; i < 37; ++i)
+        history.add({"前词", "目标", "后词"});
+    for (int i = 0; i < 3; ++i)
+        history.add({"另一前词", "目标"});
+    history.add({"单次前词", "目标"});
+    history.forget("目标");
+    FCITX_ASSERT(history.rawUnigramFrequency({"目标", ""}) == 20);
+    FCITX_ASSERT(history.rawBigramFrequency({"前词", ""}, {"目标", ""}) == 18);
+    FCITX_ASSERT(history.rawBigramFrequency({"另一前词", ""}, {"目标", ""}) ==
+                 1);
+    FCITX_ASSERT(history.rawBigramFrequency({"单次前词", ""}, {"目标", ""}) ==
+                 0);
+    FCITX_ASSERT(history.rawBigramFrequency({"目标", ""}, {"后词", ""}) == 37);
+    FCITX_ASSERT(history.rawBigramFrequency({"目标", ""}, {"</s>", ""}) == 4);
+    FCITX_ASSERT(history.rawUnigramFrequency({"前词", ""}) == 37);
+    FCITX_ASSERT(history.rawUnigramFrequency({"后词", ""}) == 37);
+    // Total was 201; halving the target removes 21 unigram observations.
+    history.setUseOnlyUnigram(true);
+    FCITX_ASSERT(std::abs(std::pow(10.0, history.score("", "目标")) -
+                          20 / 180.5) < 1e-6);
+    for (bool binary : {false, true}) {
+        std::stringstream data;
+        if (binary)
+            history.save(data);
+        else
+            history.dump(data);
+        HistoryBigram loaded;
+        if (binary)
+            loaded.load(data);
+        else
+            loaded.loadText(data);
+        FCITX_ASSERT(loaded.rawUnigramFrequency({"目标", ""}) == 20);
+        FCITX_ASSERT(loaded.rawBigramFrequency({"前词", ""}, {"目标", ""}) ==
+                     18);
+        FCITX_ASSERT(loaded.rawBigramFrequency({"目标", ""}, {"后词", ""}) ==
+                     37);
+        loaded.setUseOnlyUnigram(true);
+        FCITX_ASSERT(std::abs(std::pow(10.0, loaded.score("", "目标")) -
+                              20 / 180.5) < 1e-6);
+    }
+    history.clear();
+    FCITX_ASSERT(history.isUnknown("目标") && history.isUnknown("前词"));
+    FCITX_ASSERT(!history.containsBigram("目标", "后词"));
+    FCITX_ASSERT(history.score("", "目标") == history.unknownPenalty());
+    std::unordered_set<std::string> predictions;
+    history.fillPredict(predictions, {"目标"}, 0);
+    FCITX_ASSERT(predictions.empty());
+    history.addWithContext({{"单次前词", ""}, {"目标", ""}}, {{"新词", ""}});
+    FCITX_ASSERT(history.rawBigramFrequency({"目标", ""}, {"新词", ""}) == 0);
+    FCITX_ASSERT(history.rawBigramFrequency({"<s>", ""}, {"新词", ""}) == 1);
+}
+
+void testHalveCodes() {
+    using namespace libime;
+    HistoryBigram history;
+    for (int i = 0; i < 3; ++i) {
+        history.addWithCode({{"前词", "p"}, {"目标", "a"}, {"后词", "n"}});
+    }
+    history.addWithCode({{"前词", "p"}, {"目标", "b"}, {"后词", "n"}});
+    history.forget("目标", "a");
+    FCITX_ASSERT(history.rawUnigramFrequency({"目标", "a"}) == 1);
+    FCITX_ASSERT(history.rawUnigramFrequency({"目标", "b"}) == 1);
+    FCITX_ASSERT(history.rawUnigramFrequency({"目标", ""}) == 2);
+    FCITX_ASSERT(history.rawBigramFrequency({"前词", "p"}, {"目标", "a"}) == 1);
+    FCITX_ASSERT(history.rawBigramFrequency({"前词", "p"}, {"目标", "b"}) == 1);
+    FCITX_ASSERT(history.rawBigramFrequency({"前词", ""}, {"目标", "a"}) == 1);
+    FCITX_ASSERT(history.rawBigramFrequency({"前词", "p"}, {"目标", ""}) == 2);
+    FCITX_ASSERT(history.rawBigramFrequency({"目标", "a"}, {"后词", "n"}) == 3);
+    history.forget("目标");
+    FCITX_ASSERT(history.isUnknown("目标"));
+    FCITX_ASSERT(!history.containsBigram("前词", "目标"));
+    FCITX_ASSERT(history.rawBigramFrequency({"目标", ""}, {"后词", ""}) == 4);
+}
+
+void testSelfBigram() {
+    using namespace libime;
+    HistoryBigram history;
+    for (int i = 0; i < 3; ++i)
+        history.add({"重复", "重复"});
+    history.forget("重复");
+    FCITX_ASSERT(history.rawUnigramFrequency({"重复", ""}) == 3);
+    // A self-edge is incoming to the target, and is halved exactly once.
+    FCITX_ASSERT(history.rawBigramFrequency({"重复", ""}, {"重复", ""}) == 1);
+    FCITX_ASSERT(history.rawBigramFrequency({"重复", ""}, {"</s>", ""}) == 3);
+}
+
+void testLargeCountsAndEscaping() {
+    using namespace libime;
+    HistoryBigram history;
+    std::stringstream text;
+    text << "# libime-history-counts-v1\n"
+         << "U 4294967297 长期 \"\"\n"
+         << "B 4294967297 前词 \"\" 长期 \"\"\n";
+    history.loadText(text);
+    FCITX_ASSERT(history.rawUnigramFrequency({"长期", ""}) ==
+                 UINT64_C(4294967297));
+    history.forget("长期");
+    history.add({"长期"});
+    FCITX_ASSERT(history.rawUnigramFrequency({"长期", ""}) ==
+                 UINT64_C(2147483649));
+    FCITX_ASSERT(history.rawBigramFrequency({"前词", ""}, {"长期", ""}) ==
+                 UINT64_C(2147483648));
+    history.addWithCode(
+        {{"space tab\t newline\n quote\" slash\\", "code\t\n\"\\"}});
+    for (bool binary : {false, true}) {
+        std::stringstream data, before, after;
+        history.dump(before);
+        if (binary)
+            history.save(data);
+        else
+            history.dump(data);
+        HistoryBigram loaded;
+        if (binary)
+            loaded.load(data);
+        else
+            loaded.loadText(data);
+        loaded.dump(after);
+        FCITX_ASSERT(before.str() == after.str())
+            << before.str() << after.str();
+        FCITX_ASSERT(loaded.rawUnigramFrequency({"长期", ""}) ==
+                     UINT64_C(2147483649));
+    }
+    const auto before = history.rawUnigramFrequency({"长期", ""});
+    std::stringstream invalid("# libime-history-counts-v1\nU -1 bad \"\"\n");
+    bool threw = false;
+    try {
+        history.loadText(invalid);
+    } catch (const std::exception &) {
+        threw = true;
+    }
+    FCITX_ASSERT(threw && history.rawUnigramFrequency({"长期", ""}) == before);
+}
+
+void testLegacyFormats() {
+    using namespace libime;
+    for (uint32_t version : {1U, 2U, 3U, 4U}) {
+        std::stringstream binary;
+        marshall(binary, uint32_t{0x000fc315});
+        marshall(binary, version);
+        auto write = [version](std::ostream &out) {
+            const auto pools = version == 1 ? 2 : 3;
+            for (int pool = 0; pool < pools; ++pool) {
+                marshall(out, uint32_t{1}); // one sentence in every pool
+                marshall(out, uint32_t{1}); // one word
+                std::string word = pool == 0 ? "部队" : "不对";
+                if (version == 4)
+                    word += std::string(1, '\x02') + "bu'dui";
+                marshallString(out, word);
+            }
+        };
+        if (version >= 3)
+            writeZSTDCompressed(binary, write);
+        else
+            write(binary);
+        HistoryBigram history;
+        history.load(binary);
+        FCITX_ASSERT(history.rawUnigramFrequency({"部队", ""}) == 1);
+        FCITX_ASSERT(history.rawUnigramFrequency({"不对", ""}) ==
+                     (version == 1 ? 1 : 2));
+        FCITX_ASSERT(history.rawBigramFrequency({"<s>", ""}, {"不对", ""}) ==
+                     (version == 1 ? 1 : 2));
+        history.addWithContext({{"部队", version == 4 ? "bu'dui" : ""}},
+                               {{"后词", ""}});
+        FCITX_ASSERT(history.rawBigramFrequency({"部队", ""}, {"后词", ""}) ==
+                     1);
+        FCITX_ASSERT(history.rawBigramFrequency({"部队", ""}, {"</s>", ""}) ==
+                     0);
+    }
+    std::stringstream text(
+        "你的\tcode6\n你\tcode1 是\tcode2 一个\tcode3 好人\tcode4\n");
+    HistoryBigram history;
+    history.loadText(text);
+    FCITX_ASSERT(history.rawUnigramFrequency({"你", "code1"}) == 1);
+    FCITX_ASSERT(
+        history.rawBigramFrequency({"一个", "code3"}, {"好人", "code4"}) == 1);
+    history.addWithContext({{"你的", "code6"}}, {{"后词", ""}});
+    FCITX_ASSERT(history.rawBigramFrequency({"你的", "code6"}, {"后词", ""}) ==
+                 1);
 }
 
 } // namespace
@@ -339,5 +587,11 @@ int main() {
     testWithEmptyAndNonEmptyCode();
     testWithCodePredict();
     testAppend();
+    testAbsoluteCountsAndFormula();
+    testHalveAndClear();
+    testHalveCodes();
+    testSelfBigram();
+    testLargeCountsAndEscaping();
+    testLegacyFormats();
     return 0;
 }

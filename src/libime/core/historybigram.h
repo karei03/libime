@@ -29,6 +29,8 @@ using ValidationCodeExtractor = std::function<std::string(const WordNode *)>;
 
 class LIBIMECORE_EXPORT HistoryBigram {
 public:
+    using Count = uint64_t;
+
     using WordWithCode = std::pair<std::string, std::string>;
     using WordWithCodeView = std::pair<std::string_view, std::string_view>;
 
@@ -50,8 +52,13 @@ public:
     void setUseOnlyUnigram(bool useOnlyUnigram);
     bool useOnlyUnigram() const;
 
+    /// Halve this word and its incoming bigrams; preserve outgoing bigrams.
     void forget(std::string_view word);
     void forget(std::string_view word, std::string_view code);
+
+    /// Delete this identity's unigram and all incoming/outgoing bigrams.
+    /// Unlike forget(), this removes evidence instead of halving it.
+    void remove(std::string_view word, std::string_view code);
 
     bool isUnknown(std::string_view v) const;
     float score(const WordNode *prev, const WordNode *cur) const;
@@ -74,14 +81,14 @@ public:
     bool containsBigram(std::string_view prev, std::string_view cur) const;
 
     /**
-     * Query the weighted frequency of the unigram.
+     * Query the cumulative frequency (converted to float) of the unigram.
      *
      * @since 1.1.14
      */
     float unigramFrequency(WordWithCodeView word) const;
 
     /**
-     * Query the weighted frequency of the bigram.
+     * Query the cumulative frequency (converted to float) of the bigram.
      *
      * @since 1.1.14
      */
@@ -92,15 +99,14 @@ public:
      *
      * @since 1.1.14
      */
-    int32_t rawUnigramFrequency(WordWithCodeView word) const;
+    Count rawUnigramFrequency(WordWithCodeView word) const;
 
     /**
      * Query the raw frequency of the bigram.
      *
      * @since 1.1.14
      */
-    int32_t rawBigramFrequency(WordWithCodeView prev,
-                               WordWithCodeView cur) const;
+    Count rawBigramFrequency(WordWithCodeView prev, WordWithCodeView cur) const;
 
     void addWithContext(const std::vector<WordWithCode> &context,
                         std::vector<WordWithCode> newSentence);

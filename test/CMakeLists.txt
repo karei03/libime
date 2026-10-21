@@ -32,6 +32,9 @@ foreach(TESTCASE ${LIBIME_SINGLE_FILE_TEST})
              COMMAND ${TESTCASE})
 endforeach()
 
+# Legacy history fixtures exercise the compressed binary formats directly.
+target_link_libraries(testhistorybigram Boost::iostreams PkgConfig::ZSTD)
+
 if (ENABLE_DATA)
     add_dependencies(testpinyinime_unit lm)
     add_dependencies(testdecoder dict lm)

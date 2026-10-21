@@ -7,13 +7,17 @@
 #define _FCITX_LIBIME_PINYIN_PINYINDICTIONARY_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <istream>
 #include <memory>
 #include <optional>
 #include <ostream>
+#include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 #include <fcitx-utils/flags.h>
 #include <fcitx-utils/macros.h>
 #include <libime/core/dictionary.h>
@@ -80,6 +84,18 @@ public:
                                     std::string_view hanzi) const;
 
     void setFlags(size_t idx, PinyinDictFlags flags);
+
+    /// Exclude an encoded full-pinyin/text identity from every dictionary.
+    /// The owner persists these per-user exclusions separately from
+    /// dictionaries.
+    bool setWordBlocked(std::string_view encodedPinyin, std::string_view hanzi,
+                        bool blocked);
+    bool isWordBlocked(std::string_view encodedPinyin,
+                       std::string_view hanzi) const;
+    bool hasBlockedWords() const;
+    uint64_t blockedWordsRevision() const;
+    std::vector<std::pair<std::string, std::string>> blockedWords() const;
+    void clearBlockedWords();
 
     /**
      * Load text format into the Trie

@@ -38,6 +38,7 @@
 #include "libime/pinyin/constants.h"
 #include "pinyindecoder.h"
 #include "pinyindecoder_p.h"
+#include "pinyindictionary.h"
 #include "pinyinencoder.h"
 #include "pinyinime.h"
 #include "pinyinmatchstate.h"
@@ -73,6 +74,33 @@ std::string sentenceEncodedFullPinyin(const SentenceResult &candidate) {
         }
     }
     return pinyin;
+}
+
+// Reject a deleted identity even when the decoder reconstructs it from
+// multiple dictionary words, including inside a longer automatic sentence.
+bool containsBlockedWord(const PinyinDictionary &dict,
+                         const SentenceResult &candidate) {
+    if (!dict.hasBlockedWords()) {
+        return false;
+    }
+    const auto &nodes = candidate.sentence();
+    for (size_t start = 0; start < nodes.size(); ++start) {
+        std::string text;
+        std::string code;
+        for (size_t end = start; end < nodes.size(); ++end) {
+            const auto &pinyin =
+                nodes[end]->as<PinyinLatticeNode>().encodedPinyin();
+            if (pinyin.empty()) {
+                break;
+            }
+            text += nodes[end]->word();
+            code += pinyin;
+            if (dict.isWordBlocked(code, text)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 size_t candidateSelectTo(const SentenceResult &candidate) {
@@ -159,6 +187,7 @@ public:
     SegmentGraph segs_;
     Lattice lattice_;
     PinyinMatchState matchState_;
+    uint64_t blockedRevision_ = 0;
     std::vector<SentenceResult> candidates_;
     std::unordered_set<std::string> candidatesSet_;
     mutable bool candidatesToCursorNeedUpdate_ = true;
@@ -212,6 +241,9 @@ public:
             duplicateByPinyin;
         auto insertCandidate = [this,
                                 &duplicateByPinyin](SentenceResult candidate) {
+            if (containsBlockedWord(*ime_->dict(), candidate)) {
+                return;
+            }
             auto byPinyin = candidateDedupByPinyin(candidate);
             auto byPinyinIter = duplicateByPinyin.find(byPinyin);
             if (byPinyinIter != duplicateByPinyin.end()) {
@@ -570,16 +602,21 @@ int PinyinContext::pinyinAfterCursor() const {
 
 const std::vector<SentenceResult> &PinyinContext::candidates() const {
     FCITX_D();
+    if (d->blockedRevision_ != d->ime_->dict()->blockedWordsRevision()) {
+        const_cast<PinyinContext *>(this)->update();
+    }
     return d->candidates_;
 }
 
 const std::unordered_set<std::string> &PinyinContext::candidateSet() const {
     FCITX_D();
+    candidates();
     return d->candidatesSet_;
 }
 
 const std::vector<SentenceResult> &PinyinContext::candidatesToCursor() const {
     FCITX_D();
+    candidates();
     if (!d->needCandidatesToCursor()) {
         return d->candidates_;
     }
@@ -590,6 +627,7 @@ const std::vector<SentenceResult> &PinyinContext::candidatesToCursor() const {
 const std::unordered_set<std::string> &
 PinyinContext::candidatesToCursorSet() const {
     FCITX_D();
+    candidates();
     if (!d->needCandidatesToCursor()) {
         return d->candidatesSet_;
     }
@@ -671,6 +709,13 @@ State PinyinContext::state() const {
 
 void PinyinContext::update() {
     FCITX_D();
+    const auto revision = d->ime_->dict()->blockedWordsRevision();
+    if (d->blockedRevision_ != revision) {
+        d->clearCandidates();
+        d->lattice_.clear();
+        d->matchState_.clear();
+        d->blockedRevision_ = revision;
+    }
     if (empty()) {
         clear();
         return;
@@ -794,10 +839,13 @@ void PinyinContext::update() {
             auto &candidatesSet = d->candidatesSet_;
             candidatesSet.clear();
             std::erase_if(
-                d->candidates_,
-                [&candidatesSet, &duplicateByPinyin, &duplicateByRange, &index,
-                 &count, beginSize, limit](const SentenceResult &candidate) {
+                d->candidates_, [d, &candidatesSet, &duplicateByPinyin,
+                                 &duplicateByRange, &index, &count, beginSize,
+                                 limit](const SentenceResult &candidate) {
                     bool beforeBeginSize = index++ < beginSize;
+                    if (containsBlockedWord(*d->ime_->dict(), candidate)) {
+                        return true;
+                    }
                     auto byPinyin = candidateDedupByPinyin(candidate);
                     if (duplicateByPinyin.contains(byPinyin)) {
                         return true;
@@ -1090,6 +1138,24 @@ void PinyinContext::learn() {
     FCITX_D();
     if (!selected()) {
         return;
+    }
+
+    // Only an actual selection/commit restores a deleted identity. Looking up
+    // or loading a dictionary must never silently clear an exclusion.
+    if (d->ime_->dict()->hasBlockedWords()) {
+        const auto words = selectedWordsWithPinyin();
+        for (size_t start = 0; start < words.size(); ++start) {
+            std::string text;
+            std::string code;
+            for (size_t end = start; end < words.size(); ++end) {
+                if (words[end].second.empty()) {
+                    break;
+                }
+                text += words[end].first;
+                code += words[end].second;
+                d->ime_->dict()->setWordBlocked(code, text, false);
+            }
+        }
     }
 
     std::vector<HistoryBigram::WordWithCode> newSentence;

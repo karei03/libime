@@ -16,6 +16,7 @@
 #include <istream>
 #include <iterator>
 #include <list>
+#include <map>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -363,6 +364,9 @@ public:
 
     fcitx::ScopedConnection conn_;
     std::vector<PinyinDictFlags> flags_;
+    std::map<std::string, std::unordered_set<std::string>, std::less<>>
+        blocked_;
+    uint64_t blockedRevision_ = 0;
 };
 
 void PinyinDictionaryPrivate::addEmptyMatch(
@@ -528,9 +532,12 @@ bool PinyinDictionaryPrivate::matchWordsForOnePath(
     const bool matchLongWord =
         (path.path_.back() == &context.graph_.end() && matchLongWordEnabled);
 
-    auto foundOneWord = [&path, &prevNode, &matched, &context](
+    auto foundOneWord = [q, &path, &prevNode, &matched, &context](
                             std::string_view encodedPinyin, WordNode &word,
                             float cost, bool isCorrection) {
+        if (q->isWordBlocked(encodedPinyin, word.word())) {
+            return;
+        }
         context.callback_(path.path_, word, cost,
                           std::make_unique<PinyinLatticeNodePrivate>(
                               encodedPinyin, isCorrection));
@@ -776,12 +783,16 @@ void PinyinDictionary::matchWords(const char *data, size_t size,
 
     for (auto &node : nodes) {
         node.first->foreach(
-            [&node, &callback, size](PinyinTrie::value_type value, size_t len,
-                                     uint64_t pos) {
+            [this, &node, &callback, size](PinyinTrie::value_type value,
+                                           size_t len, uint64_t pos) {
                 std::string s;
                 node.first->suffix(s, len + size + 1, pos);
 
                 auto view = std::string_view(s);
+                if (isWordBlocked(view.substr(0, size),
+                                  view.substr(size + 1))) {
+                    return true;
+                }
                 return callback(view.substr(0, size), view.substr(size + 1),
                                 value);
             },
@@ -810,14 +821,18 @@ void PinyinDictionary::matchWordsPrefix(const char *data, size_t size,
 
     for (auto &node : nodes) {
         node.first->foreach(
-            [&node, &callback, size](PinyinTrie::value_type value, size_t len,
-                                     uint64_t pos) {
+            [this, &node, &callback, size](PinyinTrie::value_type value,
+                                           size_t len, uint64_t pos) {
                 std::string s;
                 node.first->suffix(s, len + size, pos);
 
                 std::string_view view(s);
                 if (auto sep = view.find(pinyinHanziSep, size);
                     sep != std::string::npos) {
+                    if (isWordBlocked(view.substr(0, sep),
+                                      view.substr(sep + 1))) {
+                        return true;
+                    }
                     return callback(view.substr(0, sep), view.substr(sep + 1),
                                     value);
                 }
@@ -959,5 +974,69 @@ void PinyinDictionary::setFlags(size_t idx, PinyinDictFlags flags) {
     }
     d->flags_.resize(dictSize());
     d->flags_[idx] = flags;
+}
+
+bool PinyinDictionary::setWordBlocked(std::string_view encodedPinyin,
+                                      std::string_view hanzi, bool blocked) {
+    FCITX_D();
+    if (hanzi.empty() || encodedPinyin.empty() ||
+        !PinyinEncoder::isValidUserPinyin(encodedPinyin.data(),
+                                          encodedPinyin.size())) {
+        return false;
+    }
+    bool changed = false;
+    if (blocked) {
+        changed = d->blocked_[std::string(hanzi)]
+                      .insert(std::string(encodedPinyin))
+                      .second;
+    } else if (auto iter = d->blocked_.find(hanzi); iter != d->blocked_.end()) {
+        changed = iter->second.erase(std::string(encodedPinyin)) != 0;
+        if (iter->second.empty()) {
+            d->blocked_.erase(iter);
+        }
+    }
+    if (changed) {
+        ++d->blockedRevision_;
+    }
+    return changed;
+}
+
+bool PinyinDictionary::isWordBlocked(std::string_view encodedPinyin,
+                                     std::string_view hanzi) const {
+    FCITX_D();
+    const auto iter = d->blocked_.find(hanzi);
+    return iter != d->blocked_.end() &&
+           iter->second.contains(std::string(encodedPinyin));
+}
+
+bool PinyinDictionary::hasBlockedWords() const {
+    FCITX_D();
+    return !d->blocked_.empty();
+}
+
+uint64_t PinyinDictionary::blockedWordsRevision() const {
+    FCITX_D();
+    return d->blockedRevision_;
+}
+
+std::vector<std::pair<std::string, std::string>>
+PinyinDictionary::blockedWords() const {
+    FCITX_D();
+    std::vector<std::pair<std::string, std::string>> result;
+    for (const auto &[word, codes] : d->blocked_) {
+        for (const auto &code : codes) {
+            result.emplace_back(code, word);
+        }
+    }
+    std::ranges::sort(result);
+    return result;
+}
+
+void PinyinDictionary::clearBlockedWords() {
+    FCITX_D();
+    if (!d->blocked_.empty()) {
+        d->blocked_.clear();
+        ++d->blockedRevision_;
+    }
 }
 } // namespace libime
