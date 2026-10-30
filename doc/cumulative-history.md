@@ -2,8 +2,10 @@
 
 This branch starts at upstream `9ed13b335b560b838b77ed9eab5330598dbc021e`.
 The adaptive history store uses permanent counts instead of recent pools.
-Pinyin segmentation, dictionary costs, and `UserLanguageModel` retain the upstream
-formulas. A separate per-user deletion filter now excludes explicitly deleted
+Pinyin segmentation and dictionary costs retain the upstream formulas.
+`UserLanguageModel` directly mixes base and history probabilities with a default
+history weight of 99%, without a base-probability floor. A separate per-user
+deletion filter now excludes explicitly deleted
 pinyin/text identities during matching and candidate enumeration. There is no
 lexicographic learning rank or character-suffix history model.
 
@@ -33,12 +35,11 @@ conversion remain. `N` replaces the old pool-capacity denominator in absolute
 count units; pool-derived normalization and age weights no longer exist.
 Normalization can change a probability without changing any unrelated count.
 
-The base/history combination is still exactly the upstream implementation,
-including its lower bound at the base probability:
+The base/history combination uses default weights of 1% base and 99% history,
+without the upstream lower bound at the base probability:
 
 ```
-P(w|p) = max(P_base(w|p),
-             0.8 * P_base(w|p) + 0.2 * H(w|p))
+P(w|p) = 0.01 * P_base(w|p) + 0.99 * H(w|p)
 ```
 
 The existing configurable history weight and unigram-only options remain.

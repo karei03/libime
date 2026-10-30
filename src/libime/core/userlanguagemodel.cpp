@@ -136,7 +136,7 @@ float UserLanguageModel::score(const State &state, const WordNode &word,
         userScore = d->history_.score(prev, &word);
     }
     d->setWordToState(out, &word);
-    return std::max(score, sum_log_prob(score + d->wa_, userScore + d->wb_));
+    return sum_log_prob(score + d->wa_, userScore + d->wb_);
 }
 
 bool UserLanguageModel::isUnknown(WordIndex idx, std::string_view view) const {
