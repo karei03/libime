@@ -24,6 +24,7 @@
 namespace libime {
 
 class HistoryBigramPrivate;
+class HistoryLearningEventData;
 
 using ValidationCodeExtractor = std::function<std::string(const WordNode *)>;
 
@@ -33,6 +34,16 @@ public:
 
     using WordWithCode = std::pair<std::string, std::string>;
     using WordWithCodeView = std::pair<std::string_view, std::string_view>;
+
+    class LearningEvent {
+    public:
+        LearningEvent() = default;
+        explicit operator bool() const { return static_cast<bool>(data_); }
+
+    private:
+        std::shared_ptr<HistoryLearningEventData> data_;
+        friend class HistoryBigram;
+    };
 
     HistoryBigram();
 
@@ -110,6 +121,10 @@ public:
 
     void addWithContext(const std::vector<WordWithCode> &context,
                         std::vector<WordWithCode> newSentence);
+    LearningEvent
+    addWithContextReversible(const std::vector<WordWithCode> &context,
+                             std::vector<WordWithCode> newSentence);
+    bool undo(LearningEvent event);
 
 private:
     std::unique_ptr<HistoryBigramPrivate> d_ptr;

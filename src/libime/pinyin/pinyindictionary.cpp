@@ -32,6 +32,7 @@
 #include <fcitx-utils/macros.h>
 #include <fcitx-utils/signals.h>
 #include <fcitx-utils/stringutils.h>
+#include <fcitx-utils/utf8.h>
 #include "libime/core/datrie.h"
 #include "libime/core/dictionary.h"
 #include "libime/core/languagemodel.h"
@@ -979,7 +980,9 @@ void PinyinDictionary::setFlags(size_t idx, PinyinDictFlags flags) {
 bool PinyinDictionary::setWordBlocked(std::string_view encodedPinyin,
                                       std::string_view hanzi, bool blocked) {
     FCITX_D();
+    const auto hanziLength = fcitx::utf8::lengthValidated(hanzi);
     if (hanzi.empty() || encodedPinyin.empty() ||
+        hanziLength == fcitx::utf8::INVALID_LENGTH || hanziLength <= 1 ||
         !PinyinEncoder::isValidUserPinyin(encodedPinyin.data(),
                                           encodedPinyin.size())) {
         return false;

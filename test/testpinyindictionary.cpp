@@ -114,6 +114,21 @@ void testEscape() {
         << "dump: " << dump.str();
 }
 
+void testBlockedWords() {
+    PinyinDictionary dict;
+    const auto encoded = PinyinEncoder::encodeFullPinyin("ni");
+    const std::string singleCode(encoded.begin(), encoded.end());
+    FCITX_ASSERT(!dict.setWordBlocked(singleCode, "你", true));
+    FCITX_ASSERT(!dict.isWordBlocked(singleCode, "你"));
+
+    const auto phraseEncoded = PinyinEncoder::encodeFullPinyin("ni'hao");
+    const std::string phraseCode(phraseEncoded.begin(), phraseEncoded.end());
+    FCITX_ASSERT(dict.setWordBlocked(phraseCode, "你好", true));
+    FCITX_ASSERT(dict.isWordBlocked(phraseCode, "你好"));
+    FCITX_ASSERT(dict.setWordBlocked(phraseCode, "你好", false));
+    FCITX_ASSERT(!dict.isWordBlocked(phraseCode, "你好"));
+}
+
 void testLetter() {
     std::stringstream ss;
     constexpr std::string_view input = R"(
@@ -136,5 +151,6 @@ int main() {
     testBasic();
     testEscape();
     testLetter();
+    testBlockedWords();
     return 0;
 }

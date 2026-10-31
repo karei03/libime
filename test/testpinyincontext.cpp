@@ -357,7 +357,7 @@ int main() {
         FCITX_ASSERT(c.selectedSentence() == "他爱");
         c.learn();
         c.clear();
-        FCITX_ASSERT(ime.model()->history().containsBigram("他", "爱"));
+        FCITX_ASSERT(!ime.model()->history().isUnknown("他爱"));
     }
 
     return 0;

@@ -195,6 +195,8 @@ public:
     mutable std::unordered_set<std::string> candidatesToCursorSet_;
     std::vector<fcitx::ScopedConnection> conn_;
     std::list<PinyinWordNode> contextWords_;
+    std::vector<PinyinPendingLearning> learningEvents_;
+    bool learned_ = false;
 
     size_t alignCursorToNextSegment() const {
         FCITX_Q();
@@ -309,6 +311,7 @@ public:
     void selectHelper(const FillSentence &fillSentence) {
         FCITX_Q();
         selected_.emplace_back();
+        learned_ = false;
 
         auto &selection = selected_.back();
         fillSentence(selection);
@@ -526,6 +529,8 @@ void PinyinContext::erase(size_t from, size_t to) {
         FCITX_D();
         d->clearCandidates();
         d->selected_.clear();
+        d->learningEvents_.clear();
+        d->learned_ = false;
         d->lattice_.clear();
         d->matchState_.clear();
         d->segs_ = SegmentGraph();
@@ -674,6 +679,7 @@ void PinyinContext::cancel() {
     FCITX_D();
     if (!d->selected_.empty()) {
         d->selected_.pop_back();
+        d->learned_ = false;
 
         // There is no point to reuse any existing matching state.
         // For example, cancel from (tao zi) tao zi to  tao zi tao zi.
@@ -1136,9 +1142,11 @@ PinyinContext::candidateFullPinyin(const SentenceResult &candidate) const {
 
 void PinyinContext::learn() {
     FCITX_D();
-    if (!selected()) {
+    if (!selected() || d->learned_) {
         return;
     }
+
+    std::vector<std::pair<std::string, std::string>> restoreBlockedWords;
 
     // Only an actual selection/commit restores a deleted identity. Looking up
     // or loading a dictionary must never silently clear an exclusion.
@@ -1153,18 +1161,25 @@ void PinyinContext::learn() {
                 }
                 text += words[end].first;
                 code += words[end].second;
-                d->ime_->dict()->setWordBlocked(code, text, false);
+                if (d->ime_->dict()->isWordBlocked(code, text)) {
+                    restoreBlockedWords.emplace_back(code, text);
+                    d->ime_->dict()->setWordBlocked(code, text, false);
+                }
             }
         }
     }
 
     std::vector<HistoryBigram::WordWithCode> newSentence;
+    std::optional<std::pair<std::string, std::string>> userWord;
     if (auto [result, encodedWordPinyin] = d->learnWord();
         result != LearnWordResult::Ignored) {
         // Do not insert custom to history for the first time.
         if (result == LearnWordResult::Normal) {
-            // Create new sentence with the whole new learned word.
-            newSentence.push_back({sentence(), encodedWordPinyin});
+            // The user dictionary receives the composed word, while history
+            // learns the confirmed constituent words and their adjacencies.
+            newSentence = selectedWordsWithPinyin();
+            userWord = std::pair{
+                PinyinEncoder::decodeFullPinyin(encodedWordPinyin), sentence()};
         } else {
             return;
         }
@@ -1179,9 +1194,19 @@ void PinyinContext::learn() {
         return;
     }
 
-    auto context = contextWordsWithPinyin();
-    d->ime_->model()->history().addWithContext(contextWordsWithPinyin(),
-                                               std::move(newSentence));
+    auto event = d->ime_->model()->history().addWithContextReversible(
+        contextWordsWithPinyin(), std::move(newSentence));
+    if (event) {
+        d->learningEvents_.push_back(
+            {std::move(event), 0, fcitx::utf8::length(sentence()),
+             std::move(userWord), std::move(restoreBlockedWords)});
+    }
+    d->learned_ = true;
+}
+
+std::vector<PinyinPendingLearning> PinyinContext::takeLearningEvents() {
+    FCITX_D();
+    return std::exchange(d->learningEvents_, {});
 }
 
 void PinyinContext::setContextWords(

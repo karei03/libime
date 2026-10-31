@@ -1,4 +1,5 @@
 set(LIBIME_PINYIN_HDRS
+    pinyinlearninghistory.h
     pinyincontext.h
     pinyindata.h
     pinyindecoder.h
@@ -15,6 +16,7 @@ set(LIBIME_PINYIN_HDRS
     )
 
 set(LIBIME_PINYIN_SRCS
+    pinyinlearninghistory.cpp
     pinyincontext.cpp
     pinyindata.cpp
     pinyindecoder.cpp

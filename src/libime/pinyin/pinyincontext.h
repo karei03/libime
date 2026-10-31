@@ -19,6 +19,7 @@
 #include <libime/core/languagemodel.h>
 #include <libime/core/lattice.h>
 #include <libime/pinyin/libimepinyin_export.h>
+#include <libime/pinyin/pinyinlearninghistory.h>
 #include "libime/core/historybigram.h"
 
 namespace libime {
@@ -123,6 +124,7 @@ public:
 
     /// Add the selected part to history if selected() == true.
     void learn();
+    std::vector<PinyinPendingLearning> takeLearningEvents();
 
     /// Return the position of last pinyin. E.g. 你h|ao, return the offset
     /// before h.

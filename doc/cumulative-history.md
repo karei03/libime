@@ -47,6 +47,19 @@ Scoring uses indexed lookups and cached totals, including totals for queries
 with omitted validation codes. It never scans all historical observations.
 Totals are updated with learning and forgetting, and rebuilt while loading.
 
+## Reversible committed learning
+
+Each confirmed pinyin selection creates a process-local receipt containing the
+exact unigram and bigram increments, any newly created user-dictionary identity,
+and any deleted-word exclusions restored by that selection. The frontend maps
+the receipt to Unicode ranges in the acknowledged surrounding text. A confirmed
+Backspace, Delete, or selection deletion cancels a receipt only after all of its
+original characters have been removed; partial deletion keeps the surviving
+learning. The cancellation transaction subtracts only that receipt's increments
+and is one-shot, so later uses of the same word remain learned. Invalid or
+unavailable surrounding text, focus loss, explicit forget, and clear invalidate
+pending receipts without guessing a rollback.
+
 ## Forget and clear
 
 `forget(w)` halves each stored unigram identity for that word and each incoming
@@ -89,12 +102,13 @@ Escape cancels. The corresponding candidate context-menu actions are separate.
   The prior cumulative-history policy remains: each distinct constituent word
   in a compound candidate is halved once. User entries and explicit pins remain.
 * `ForgetWord`, default `Control+7`: keeps the original shortcut/configuration
-  key but now deletes the selected complete pinyin/text identity. The action
-  removes the exact user-dictionary entry and its exact-code unigram and both
-  incoming and outgoing history records. Unlike the author's sentence removal,
-  unrelated words' unigram counts are not cleared. Compound candidates delete
-  the whole selected identity, not their individual characters or constituent
-  words.
+  key but forgets the selected exact pinyin/text identity. For a single-character
+  candidate, it removes that identity's unigram and all incoming/outgoing history
+  records while leaving system and explicit user-dictionary entries available.
+  For a multi-character candidate, it also removes the exact user-dictionary entry
+  and adds a per-user exclusion, so the complete identity stays hidden. Unrelated
+  words' unigram counts are not cleared, and compound candidates are handled as
+  one selected identity rather than as independent character deletions.
 
 Read-only system and built-in dictionaries receive a per-user exclusion overlay;
 shared dictionary files are not rewritten. libime checks the overlay on ordinary

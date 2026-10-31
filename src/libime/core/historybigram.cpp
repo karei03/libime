@@ -202,8 +202,23 @@ Count parseCount(std::string_view value) {
 }
 } // namespace
 
+class HistoryLearningEventData {
+public:
+    std::weak_ptr<int> owner;
+    uint64_t generation = 0;
+    std::vector<WordWithCode> sentence;
+    std::vector<WordWithCode> beforeLatest;
+    uint64_t beforeLatestRevision = 0;
+    uint64_t afterLatestRevision = 0;
+    bool append = false;
+    bool active = false;
+};
+
 class HistoryBigramPrivate {
 public:
+    std::shared_ptr<int> lifetime_ = std::make_shared<int>(0);
+    uint64_t receiptGeneration_ = 0;
+    uint64_t latestRevision_ = 0;
     StringMap<Counts> unigram_;
     StringMap<StringMap<BigramCounts>> bigram_;
     Count total_ = 0;
@@ -236,15 +251,41 @@ public:
         bigram_[std::string(prev.first)][std::string(cur.first)].add(
             prev.second, cur.second, n);
     }
-    void subtractBigram(WordWithCodeView prev, WordWithCodeView cur, Count n) {
+    bool subtractUnigram(WordWithCodeView word, Count n) {
+        auto unigram = unigram_.find(word.first);
+        if (unigram == unigram_.end()) {
+            return false;
+        }
+        auto item = unigram->second.codes.find(word.second);
+        if (item == unigram->second.codes.end()) {
+            return false;
+        }
+        n = std::min(n, item->second);
+        item->second -= n;
+        unigram->second.total -= n;
+        total_ -= n;
+        if (!item->second) {
+            unigram->second.codes.erase(item);
+        }
+        if (!unigram->second.total) {
+            unigram_.erase(unigram);
+        }
+        return n != 0;
+    }
+    bool subtractBigram(WordWithCodeView prev, WordWithCodeView cur, Count n) {
         auto before = bigram_.find(prev.first);
         if (before == bigram_.end()) {
-            return;
+            return false;
         }
         auto after = before->second.find(cur.first);
         if (after == before->second.end()) {
-            return;
+            return false;
         }
+        const auto beforeCount = after->second.exact(prev.second, cur.second);
+        if (!beforeCount) {
+            return false;
+        }
+        n = std::min(n, beforeCount);
         after->second.subtract(prev.second, cur.second, n);
         if (!after->second.total) {
             before->second.erase(after);
@@ -252,6 +293,7 @@ public:
         if (before->second.empty()) {
             bigram_.erase(before);
         }
+        return n != 0;
     }
     static bool valid(const std::vector<WordWithCode> &sentence) {
         return !sentence.empty() &&
@@ -278,6 +320,7 @@ public:
             latest_.push_back(word);
         }
         addBigram(latest_.back(), {"</s>", ""}, 1);
+        ++latestRevision_;
     }
     bool canAppend(const std::vector<WordWithCode> &context) const {
         return !context.empty() && latest_.size() >= context.size() &&
@@ -435,6 +478,57 @@ void HistoryBigram::addWithContext(const std::vector<WordWithCode> &context,
                                    std::vector<WordWithCode> sentence) {
     FCITX_D();
     d->add(sentence, d->canAppend(context));
+}
+HistoryBigram::LearningEvent HistoryBigram::addWithContextReversible(
+    const std::vector<WordWithCode> &context,
+    std::vector<WordWithCode> sentence) {
+    FCITX_D();
+    if (!HistoryBigramPrivate::valid(sentence)) {
+        return {};
+    }
+    auto event = std::make_shared<HistoryLearningEventData>();
+    event->owner = d->lifetime_;
+    event->generation = d->receiptGeneration_;
+    event->beforeLatest = d->latest_;
+    event->beforeLatestRevision = d->latestRevision_;
+    event->sentence = std::move(sentence);
+    event->append = d->canAppend(context);
+    d->add(event->sentence, event->append);
+    event->afterLatestRevision = d->latestRevision_;
+    event->active = true;
+    LearningEvent result;
+    result.data_ = std::move(event);
+    return result;
+}
+bool HistoryBigram::undo(LearningEvent event) {
+    FCITX_D();
+    if (!event.data_ || !event.data_->active ||
+        event.data_->owner.lock() != d->lifetime_ ||
+        event.data_->generation != d->receiptGeneration_) {
+        return false;
+    }
+    const auto start = WordWithCode{"<s>", ""};
+    const auto end = WordWithCode{"</s>", ""};
+    auto previous =
+        event.data_->append ? event.data_->beforeLatest.back() : start;
+    if (event.data_->append) {
+        d->addBigram(event.data_->beforeLatest.back(), end, 1);
+    } else {
+        d->subtractUnigram(start, 1);
+        d->subtractUnigram(end, 1);
+    }
+    for (const auto &word : event.data_->sentence) {
+        d->subtractUnigram(word, 1);
+        d->subtractBigram(previous, word, 1);
+        previous = word;
+    }
+    d->subtractBigram(previous, end, 1);
+    if (d->latestRevision_ == event.data_->afterLatestRevision) {
+        d->latest_ = event.data_->beforeLatest;
+        d->latestRevision_ = event.data_->beforeLatestRevision;
+    }
+    event.data_->active = false;
+    return true;
 }
 bool HistoryBigram::isUnknown(std::string_view word) const {
     return rawUnigramFrequency({word, ""}) == 0;
@@ -625,10 +719,12 @@ void HistoryBigram::clear() {
 void HistoryBigram::forget(std::string_view word) { forget(word, ""); }
 void HistoryBigram::forget(std::string_view word, std::string_view code) {
     FCITX_D();
+    ++d->receiptGeneration_;
     d->forget(word, code);
 }
 void HistoryBigram::remove(std::string_view word, std::string_view code) {
     FCITX_D();
+    ++d->receiptGeneration_;
     auto unigram = d->unigram_.find(word);
     if (unigram != d->unigram_.end()) {
         for (auto iter = unigram->second.codes.begin();
@@ -647,7 +743,8 @@ void HistoryBigram::remove(std::string_view word, std::string_view code) {
     }
     // Remove only edges involving this identity; other words' counts survive.
     for (auto before = d->bigram_.begin(); before != d->bigram_.end();) {
-        for (auto after = before->second.begin(); after != before->second.end();) {
+        for (auto after = before->second.begin();
+             after != before->second.end();) {
             auto &pair = after->second;
             std::vector<std::pair<WordWithCode, Count>> changes;
             for (const auto &[prevCode, row] : pair.rows) {
@@ -676,7 +773,8 @@ void HistoryBigram::remove(std::string_view word, std::string_view code) {
         }
     }
     if (std::ranges::any_of(d->latest_, [word, code](const auto &entry) {
-            return entry.first == word && (code.empty() || entry.second == code);
+            return entry.first == word &&
+                   (code.empty() || entry.second == code);
         })) {
         d->latest_.clear();
     }

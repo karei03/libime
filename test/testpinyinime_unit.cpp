@@ -58,8 +58,7 @@ void testPinyin(PinyinIME &ime) {
                                          "ni'hao'zhong'guo", "你好中国"));
     c.select(std::distance(c.candidates().begin(), iter));
     c.learn();
-    FCITX_ASSERT(ime.model()->history().containsBigram("你", "好"));
-    FCITX_ASSERT(ime.model()->history().containsBigram("好", "中国"));
+    FCITX_ASSERT(ime.model()->history().containsBigram("你好", "中国"));
 }
 
 void testShuangpin(PinyinIME &ime) {

@@ -345,6 +345,44 @@ void testAppend() {
     }
 }
 
+void testReversibleLearning() {
+    using namespace libime;
+    HistoryBigram history;
+    auto event =
+        history.addWithContextReversible({}, {{"甲", "a"}, {"乙", "b"}});
+    FCITX_ASSERT(event);
+    FCITX_ASSERT(history.rawUnigramFrequency({"甲", "a"}) == 1);
+    FCITX_ASSERT(history.rawUnigramFrequency({"乙", "b"}) == 1);
+    FCITX_ASSERT(history.rawBigramFrequency({"甲", "a"}, {"乙", "b"}) == 1);
+    FCITX_ASSERT(history.undo(event));
+    FCITX_ASSERT(history.rawUnigramFrequency({"甲", "a"}) == 0);
+    FCITX_ASSERT(history.rawUnigramFrequency({"乙", "b"}) == 0);
+    FCITX_ASSERT(!history.undo(event));
+
+    history.addWithCode({{"前词", "p"}});
+    auto appended =
+        history.addWithContextReversible({{"前词", "p"}}, {{"后词", "q"}});
+    FCITX_ASSERT(history.rawBigramFrequency({"前词", "p"}, {"</s>", ""}) == 0);
+    FCITX_ASSERT(history.rawBigramFrequency({"前词", "p"}, {"后词", "q"}) == 1);
+    FCITX_ASSERT(history.undo(appended));
+    FCITX_ASSERT(history.rawUnigramFrequency({"前词", "p"}) == 1);
+    FCITX_ASSERT(history.rawUnigramFrequency({"后词", "q"}) == 0);
+    FCITX_ASSERT(history.rawBigramFrequency({"前词", "p"}, {"</s>", ""}) == 1);
+
+    auto invalidated = history.addWithContextReversible({}, {{"失效", "x"}});
+    history.forget("失效", "x");
+    FCITX_ASSERT(!history.undo(invalidated));
+
+    history.clear();
+    auto first = history.addWithContextReversible({}, {{"甲", "a"}});
+    auto second =
+        history.addWithContextReversible({{"甲", "a"}}, {{"乙", "b"}});
+    FCITX_ASSERT(history.undo(second));
+    FCITX_ASSERT(history.undo(first));
+    FCITX_ASSERT(history.rawUnigramFrequency({"甲", "a"}) == 0);
+    FCITX_ASSERT(history.rawUnigramFrequency({"乙", "b"}) == 0);
+}
+
 void testAbsoluteCountsAndFormula() {
     using namespace libime;
     HistoryBigram history;
@@ -468,6 +506,20 @@ void testHalveCodes() {
     FCITX_ASSERT(history.rawBigramFrequency({"目标", ""}, {"后词", ""}) == 4);
 }
 
+void testRemoveIdentity() {
+    using namespace libime;
+    HistoryBigram history;
+    history.addWithCode({{"前", "p"}, {"甲", "a"}, {"后", "h"}});
+    history.addWithCode({{"前", "p"}, {"乙", "e"}, {"后", "h"}});
+    history.remove("甲", "a");
+    FCITX_ASSERT(history.isUnknown("甲"));
+    FCITX_ASSERT(!history.containsBigram("前", "甲"));
+    FCITX_ASSERT(!history.containsBigram("甲", "后"));
+    FCITX_ASSERT(history.rawUnigramFrequency({"乙", "e"}) == 1);
+    FCITX_ASSERT(history.rawBigramFrequency({"前", "p"}, {"乙", "e"}) == 1);
+    FCITX_ASSERT(history.rawBigramFrequency({"乙", "e"}, {"后", "h"}) == 1);
+}
+
 void testSelfBigram() {
     using namespace libime;
     HistoryBigram history;
@@ -587,9 +639,11 @@ int main() {
     testWithEmptyAndNonEmptyCode();
     testWithCodePredict();
     testAppend();
+    testReversibleLearning();
     testAbsoluteCountsAndFormula();
     testHalveAndClear();
     testHalveCodes();
+    testRemoveIdentity();
     testSelfBigram();
     testLargeCountsAndEscaping();
     testLegacyFormats();
